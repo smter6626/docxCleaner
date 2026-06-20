@@ -39,6 +39,7 @@ NS_EP = "http://schemas.openxmlformats.org/officeDocument/2006/extended-properti
 NS_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 NS_VT = "http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"
 NS_CUSTOM = "http://schemas.openxmlformats.org/officeDocument/2006/custom-properties"
+NS_XSI = "http://www.w3.org/2001/XMLSchema-instance"
 
 NS = {
     "cp": NS_CP,
@@ -48,7 +49,14 @@ NS = {
     "w": NS_W,
     "vt": NS_VT,
     "custom": NS_CUSTOM,
+    "xsi": NS_XSI,
 }
+
+ET.register_namespace("cp", NS_CP)
+ET.register_namespace("dc", NS_DC)
+ET.register_namespace("dcterms", NS_DCTERMS)
+ET.register_namespace("ep", NS_EP)
+ET.register_namespace("xsi", NS_XSI)
 
 
 def section(title):
@@ -512,54 +520,222 @@ def analyze_docx(path: Path) -> str:
     return output.getvalue()
 
 
-def modify_timestamps(original_path):
-    """
-    修改时间戳：
-    1. core.xml 的创建/修改时间改为当前 UTC 时间
-    2. 所有 ZIP 条目的时间改为当前时间
-    生成新文件：原文件名 + '_modified' 后缀
-    """
-    path = Path(original_path)
-    new_path = path.with_stem(path.stem + "_modified")
+def _parse_docx_datetime(value):
+    if not value:
+        return None
+
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _format_utc_datetime(dt):
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _find_or_create(root, xpath, namespace_uri, tag_name):
+    elem = root.find(xpath, NS)
+    if elem is None:
+        elem = ET.SubElement(root, f"{{{namespace_uri}}}{tag_name}")
+    return elem
+
+
+def _copy_zip_info(info, date_time=None):
+    copied = zipfile.ZipInfo(info.filename, date_time or info.date_time)
+    copied.compress_type = info.compress_type
+    copied.comment = info.comment
+    copied.extra = info.extra
+    copied.internal_attr = info.internal_attr
+    copied.external_attr = info.external_attr
+    copied.create_system = info.create_system
+    copied.create_version = info.create_version
+    copied.extract_version = info.extract_version
+    copied.flag_bits = info.flag_bits
+    return copied
+
+
+def _zip_datetime_from_iso(iso_value):
+    parsed = _parse_docx_datetime(iso_value)
+    if parsed is None:
+        raise ValueError(f"无效的 UTC 时间格式: {iso_value}")
+    if parsed.year < 1980:
+        raise ValueError("ZIP 内部时间戳年份不能早于 1980。")
+    return (
+        parsed.year,
+        parsed.month,
+        parsed.day,
+        parsed.hour,
+        parsed.minute,
+        parsed.second,
+    )
+
+
+def _update_core_properties_xml(
+    data,
+    creator,
+    last_modified_by,
+    created_iso,
+    modified_iso,
+):
+    root = ET.fromstring(data)
+
+    creator_el = _find_or_create(root, ".//dc:creator", NS_DC, "creator")
+    creator_el.text = creator
+
+    modifier_el = _find_or_create(
+        root,
+        ".//cp:lastModifiedBy",
+        NS_CP,
+        "lastModifiedBy",
+    )
+    modifier_el.text = last_modified_by
+
+    created_el = _find_or_create(root, ".//dcterms:created", NS_DCTERMS, "created")
+    created_el.text = created_iso
+    created_el.set(f"{{{NS_XSI}}}type", "dcterms:W3CDTF")
+
+    modified_el = _find_or_create(
+        root,
+        ".//dcterms:modified",
+        NS_DCTERMS,
+        "modified",
+    )
+    modified_el.text = modified_iso
+    modified_el.set(f"{{{NS_XSI}}}type", "dcterms:W3CDTF")
+
+    return ET.tostring(root, encoding="UTF-8", xml_declaration=True)
+
+
+def _update_app_properties_xml(data, total_time):
+    root = ET.fromstring(data)
+    total_time_el = _find_or_create(root, ".//ep:TotalTime", NS_EP, "TotalTime")
+    total_time_el.text = str(total_time)
+    return ET.tostring(root, encoding="UTF-8", xml_declaration=True)
+
+
+def read_basic_metadata_defaults(source_path: Path):
+    source_path = Path(source_path)
+    if not source_path.exists():
+        raise FileNotFoundError(f"文件不存在: {source_path}")
+
+    try:
+        with zipfile.ZipFile(source_path, "r") as z:
+            names = set(z.namelist())
+            if "docProps/core.xml" not in names:
+                raise ValueError("DOCX 缺少 docProps/core.xml，无法修改核心属性。")
+            if "docProps/app.xml" not in names:
+                raise ValueError("DOCX 缺少 docProps/app.xml，无法修改应用属性。")
+
+            core_root = ET.fromstring(z.read("docProps/core.xml"))
+            app_root = ET.fromstring(z.read("docProps/app.xml"))
+    except zipfile.BadZipFile as exc:
+        raise ValueError("文件不是合法 DOCX/ZIP，无法打开。") from exc
+
     now = datetime.now(timezone.utc)
-    new_time_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-    # ZIP 内部时间戳（不含时区，使用本地时间或者 UTC）
-    new_zip_date = (now.year, now.month, now.day, now.hour, now.minute, now.second)
+    created = _parse_docx_datetime(core_root.findtext(".//dcterms:created", namespaces=NS))
+    modified = _parse_docx_datetime(
+        core_root.findtext(".//dcterms:modified", namespaces=NS)
+    )
 
-    # 读取原始文件全部内容到内存
-    with zipfile.ZipFile(path, "r") as zin:
-        items = {}
-        for info in zin.infolist():
-            data = zin.read(info.filename)
-            items[info.filename] = (info, data)
+    try:
+        total_time = int(app_root.findtext(".//ep:TotalTime", default="60", namespaces=NS))
+    except (TypeError, ValueError):
+        total_time = 60
 
-    # 修改 core.xml 的内容（如果存在）
-    core_key = "docProps/core.xml"
-    if core_key in items:
-        info, data = items[core_key]
-        root = ET.fromstring(data)
-        # 修改创建时间和修改时间
-        for tag, xpath in [("创建时间", ".//dcterms:created"),
-                           ("修改时间", ".//dcterms:modified")]:
-            el = root.find(xpath, NS)
-            if el is not None:
-                el.text = new_time_str
-        new_data = ET.tostring(root, encoding="UTF-8", xml_declaration=True)
-        items[core_key] = (info, new_data)
-        print(f"  已修改 core.xml 中的创建/修改时间为 {new_time_str}")
-    else:
-        print("  未找到 core.xml，跳过修改。")
+    if total_time < 0 or total_time > 9999:
+        total_time = 60
 
-    # 写入新 zip，并将所有条目时间设为当前时间
-    with zipfile.ZipFile(new_path, "w", zipfile.ZIP_DEFLATED) as zout:
-        for fname, (info, data) in items.items():
-            new_info = zipfile.ZipInfo(filename=fname)
-            # 设置新的时间戳
-            new_info.date_time = new_zip_date
-            zout.writestr(new_info, data)
+    return {
+        "creator": core_root.findtext(".//dc:creator", default="", namespaces=NS) or "",
+        "last_modified_by": core_root.findtext(
+            ".//cp:lastModifiedBy",
+            default="",
+            namespaces=NS,
+        )
+        or "",
+        "created": created or now,
+        "modified": modified or now,
+        "total_time": total_time,
+    }
 
-    print(f"  新文件已生成: {new_path}")
-    return new_path
+
+def write_basic_metadata_cleaned_docx(
+    source_path: Path,
+    creator: str,
+    last_modified_by: str,
+    created_iso: str,
+    modified_iso: str,
+    total_time: int,
+    unify_zip_timestamps: bool = True,
+) -> Path:
+    source_path = Path(source_path)
+    if not source_path.exists():
+        raise FileNotFoundError(f"文件不存在: {source_path}")
+
+    try:
+        total_time = int(total_time)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("编辑时长必须是 0 到 9999 之间的整数。") from exc
+    if total_time < 0 or total_time > 9999:
+        raise ValueError("编辑时长必须是 0 到 9999 之间的整数。")
+
+    if _parse_docx_datetime(created_iso) is None:
+        raise ValueError(f"创建时间不是合法 UTC 时间: {created_iso}")
+    if _parse_docx_datetime(modified_iso) is None:
+        raise ValueError(f"修改时间不是合法 UTC 时间: {modified_iso}")
+
+    output_path = source_path.with_name(source_path.stem + "_cleaned.docx")
+    if output_path.resolve() == source_path.resolve():
+        raise ValueError("输出路径不能覆盖原始文件。")
+
+    unified_zip_datetime = None
+    if unify_zip_timestamps:
+        unified_zip_datetime = _zip_datetime_from_iso(modified_iso)
+
+    try:
+        with zipfile.ZipFile(source_path, "r") as zin:
+            names = set(zin.namelist())
+            if "docProps/core.xml" not in names:
+                raise ValueError("DOCX 缺少 docProps/core.xml，无法修改核心属性。")
+            if "docProps/app.xml" not in names:
+                raise ValueError("DOCX 缺少 docProps/app.xml，无法修改应用属性。")
+
+            items = []
+            for info in zin.infolist():
+                data = zin.read(info.filename)
+                if info.filename == "docProps/core.xml":
+                    data = _update_core_properties_xml(
+                        data,
+                        creator,
+                        last_modified_by,
+                        created_iso,
+                        modified_iso,
+                    )
+                elif info.filename == "docProps/app.xml":
+                    data = _update_app_properties_xml(data, total_time)
+                items.append((info, data))
+    except zipfile.BadZipFile as exc:
+        raise ValueError("文件不是合法 DOCX/ZIP，无法打开。") from exc
+
+    try:
+        with zipfile.ZipFile(output_path, "w") as zout:
+            for info, data in items:
+                date_time = unified_zip_datetime if unify_zip_timestamps else info.date_time
+                new_info = _copy_zip_info(info, date_time=date_time)
+                zout.writestr(new_info, data)
+    except OSError as exc:
+        raise OSError(f"写入 _cleaned.docx 失败: {exc}") from exc
+
+    return output_path
 
 
 # ===== 阶段1完成：GUI 基础框架 =====
@@ -596,7 +772,7 @@ class DocxMetadataApp:
         metadata_button = tk.Button(
             toolbar,
             text="修改元数据",
-            command=self.show_future_message,
+            command=self.open_metadata_editor,
             width=12,
         )
         metadata_button.pack(side=tk.LEFT, padx=(0, 8))
@@ -634,7 +810,6 @@ class DocxMetadataApp:
             title="选择 DOCX 文件",
             filetypes=[
                 ("Word 文档", "*.docx"),
-                ("所有文件", "*.*"),
             ],
         )
         if not filename:
@@ -664,6 +839,230 @@ class DocxMetadataApp:
         self.report_text.delete("1.0", tk.END)
         self.report_text.insert(tk.END, report)
         self.report_text.configure(state=tk.DISABLED)
+
+    def open_metadata_editor(self):
+        if self.selected_path is None:
+            messagebox.showwarning("未选择文件", "请先选择 DOCX 文件。")
+            return
+
+        if not self.selected_path.exists():
+            messagebox.showerror("文件不存在", f"文件不存在:\n{self.selected_path}")
+            self.status_label.configure(text=f"文件不存在: {self.selected_path}")
+            return
+
+        try:
+            defaults = read_basic_metadata_defaults(self.selected_path)
+        except Exception as exc:
+            messagebox.showerror("无法打开修改窗口", str(exc))
+            return
+
+        editor = tk.Toplevel(self.root)
+        editor.title("修改元数据")
+        editor.resizable(False, False)
+        editor.transient(self.root)
+
+        form = tk.Frame(editor, padx=14, pady=14)
+        form.grid(row=0, column=0, sticky="nsew")
+
+        current_item_label = tk.Label(
+            form,
+            text="当前编辑项：无",
+            anchor=tk.W,
+        )
+        current_item_label.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+
+        creator_var = tk.StringVar(value=defaults["creator"])
+        last_modified_by_var = tk.StringVar(value=defaults["last_modified_by"])
+        total_time_var = tk.StringVar(value=str(defaults["total_time"]))
+
+        tk.Label(form, text="创建者", anchor=tk.W).grid(row=1, column=0, sticky="w", pady=4)
+        creator_entry = tk.Entry(form, textvariable=creator_var, width=36)
+        creator_entry.grid(row=1, column=1, sticky="ew", pady=4)
+        self._bind_current_item(creator_entry, current_item_label, "创建者")
+
+        tk.Label(form, text="最后修改人", anchor=tk.W).grid(row=2, column=0, sticky="w", pady=4)
+        modifier_entry = tk.Entry(form, textvariable=last_modified_by_var, width=36)
+        modifier_entry.grid(row=2, column=1, sticky="ew", pady=4)
+        self._bind_current_item(modifier_entry, current_item_label, "最后修改人")
+
+        tk.Label(form, text="编辑时长（分钟）", anchor=tk.W).grid(
+            row=3,
+            column=0,
+            sticky="w",
+            pady=4,
+        )
+        total_time_spinbox = tk.Spinbox(
+            form,
+            from_=0,
+            to=9999,
+            textvariable=total_time_var,
+            width=8,
+        )
+        total_time_spinbox.grid(row=3, column=1, sticky="w", pady=4)
+        self._bind_current_item(total_time_spinbox, current_item_label, "编辑时长")
+
+        created_vars = self._build_datetime_row(
+            form,
+            4,
+            "创建时间 UTC",
+            defaults["created"],
+            current_item_label,
+            "创建时间",
+        )
+        modified_vars = self._build_datetime_row(
+            form,
+            5,
+            "修改时间 UTC",
+            defaults["modified"],
+            current_item_label,
+            "修改时间",
+        )
+
+        unify_zip_var = tk.BooleanVar(value=True)
+        unify_check = tk.Checkbutton(
+            form,
+            text="统一 ZIP 内部文件时间戳为修改时间",
+            variable=unify_zip_var,
+        )
+        unify_check.grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 4))
+
+        button_row = tk.Frame(form)
+        button_row.grid(row=7, column=0, columnspan=2, sticky="e", pady=(12, 0))
+
+        apply_button = tk.Button(
+            button_row,
+            text="应用修改",
+            command=lambda: self.apply_metadata_changes(
+                editor,
+                creator_var.get(),
+                last_modified_by_var.get(),
+                total_time_var.get(),
+                created_vars,
+                modified_vars,
+                unify_zip_var.get(),
+            ),
+            width=12,
+        )
+        apply_button.pack(side=tk.LEFT, padx=(0, 8))
+
+        cancel_button = tk.Button(
+            button_row,
+            text="取消",
+            command=editor.destroy,
+            width=10,
+        )
+        cancel_button.pack(side=tk.LEFT)
+
+        form.columnconfigure(1, weight=1)
+        editor.grab_set()
+
+    def _bind_current_item(self, widget, label, field_name):
+        widget.bind(
+            "<FocusIn>",
+            lambda _event: label.configure(text=f"当前编辑项：{field_name}"),
+        )
+
+    def _build_datetime_row(self, parent, row, label_text, dt, current_item_label, field_name):
+        tk.Label(parent, text=label_text, anchor=tk.W).grid(
+            row=row,
+            column=0,
+            sticky="w",
+            pady=4,
+        )
+
+        holder = tk.Frame(parent)
+        holder.grid(row=row, column=1, sticky="w", pady=4)
+
+        spinbox_specs = [
+            ("year", "年", dt.year, 1980, 9999, 5),
+            ("month", "月", dt.month, 1, 12, 3),
+            ("day", "日", dt.day, 1, 31, 3),
+            ("hour", "时", dt.hour, 0, 23, 3),
+            ("minute", "分", dt.minute, 0, 59, 3),
+            ("second", "秒", dt.second, 0, 59, 3),
+        ]
+
+        variables = {}
+        for index, (key, unit, value, min_value, max_value, width) in enumerate(spinbox_specs):
+            text_value = str(value) if key == "year" else f"{value:02d}"
+            var = tk.StringVar(value=text_value)
+            spinbox = tk.Spinbox(
+                holder,
+                from_=min_value,
+                to=max_value,
+                textvariable=var,
+                width=width,
+                wrap=True,
+            )
+            spinbox.grid(row=0, column=index * 2, sticky="w")
+            tk.Label(holder, text=unit).grid(row=0, column=index * 2 + 1, sticky="w", padx=(2, 6))
+            self._bind_current_item(spinbox, current_item_label, field_name)
+            variables[key] = var
+
+        return variables
+
+    def _datetime_vars_to_iso(self, variables, field_name):
+        try:
+            year = int(variables["year"].get())
+            month = int(variables["month"].get())
+            day = int(variables["day"].get())
+            hour = int(variables["hour"].get())
+            minute = int(variables["minute"].get())
+            second = int(variables["second"].get())
+        except ValueError as exc:
+            raise ValueError(f"{field_name}必须全部填写为数字。") from exc
+
+        try:
+            dt = datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
+        except ValueError as exc:
+            raise ValueError(f"{field_name}不是合法 UTC 时间: {exc}") from exc
+
+        return _format_utc_datetime(dt)
+
+    def apply_metadata_changes(
+        self,
+        editor,
+        creator,
+        last_modified_by,
+        total_time_text,
+        created_vars,
+        modified_vars,
+        unify_zip_timestamps,
+    ):
+        try:
+            total_time = int(total_time_text)
+        except ValueError:
+            messagebox.showerror("输入错误", "编辑时长必须是 0 到 9999 之间的整数。")
+            return
+
+        if total_time < 0 or total_time > 9999:
+            messagebox.showerror("输入错误", "编辑时长必须是 0 到 9999 之间的整数。")
+            return
+
+        try:
+            created_iso = self._datetime_vars_to_iso(created_vars, "创建时间")
+            modified_iso = self._datetime_vars_to_iso(modified_vars, "修改时间")
+        except ValueError as exc:
+            messagebox.showerror("输入错误", str(exc))
+            return
+
+        try:
+            output_path = write_basic_metadata_cleaned_docx(
+                self.selected_path,
+                creator,
+                last_modified_by,
+                created_iso,
+                modified_iso,
+                total_time,
+                unify_zip_timestamps=unify_zip_timestamps,
+            )
+        except Exception as exc:
+            messagebox.showerror("修改失败", str(exc))
+            return
+
+        messagebox.showinfo("修改成功", f"已生成:\n{output_path}")
+        editor.destroy()
+        self.status_label.configure(text=f"已生成: {output_path}")
 
     def show_future_message(self):
         messagebox.showinfo("后续阶段实现", "该功能将在后续阶段实现。")
