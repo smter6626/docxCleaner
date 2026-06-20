@@ -152,146 +152,215 @@
 
 - `6bcf98a Add tkinter report viewer for DOCX metadata`
 
-审查结论：
+---
 
-- B2 目标已满足，可以进入下一阶段；
-- 当前只发现一个非阻塞细节：文件选择器仍包含“所有文件”选项，严格来说不是“仅显示 .docx”，可在下一轮顺手修正。
+### 2026-06-20：基础元数据修改窗口与 `_cleaned.docx` 输出
+
+状态：已完成
+
+完成内容：
+
+1. 新增基础元数据修改窗口。
+2. 新增底层函数 `write_basic_metadata_cleaned_docx(...)`。
+3. 新增 `read_basic_metadata_defaults(...)` 和 XML/ZIP 辅助函数。
+4. 移除旧 `modify_timestamps()`，不再保留 `_modified` 输出规则。
+5. 可修改：
+   - `dc:creator`；
+   - `cp:lastModifiedBy`；
+   - `dcterms:created`；
+   - `dcterms:modified`；
+   - `ep:TotalTime`。
+6. 输出同目录 `_cleaned.docx`。
+7. `一键清理` 仍是“后续阶段实现”。
+8. 文件选择器已移除“所有文件”，只保留 `.docx`。
+9. 用户已手动验证：基础数据修改可正常实现，未选择文件时会正确提示。
+
+相关提交：
+
+- `2612ab6 Add basic DOCX metadata editor`
 
 ---
 
 ## 4. 当前 Active 任务
 
-### Active 任务 B3：基础元数据修改窗口与 `_cleaned.docx` 输出
+### Active 任务 B4：RSID 异常值规范化
 
 状态：active
 
 ### 4.1 任务目标
 
-在现有 GUI 基础上，实现第一批可编辑元数据字段，并生成新的 `_cleaned.docx` 文件。
+在现有 GUI 基础上，实现 RSID 异常值规范化功能。
 
-本阶段只处理基础单值字段，不处理 RSID，不做完整一键清理。
+本阶段不做“用户指定 RSID 数量”。第一版保持 RSID 数量不变，只处理异常或需要重写的 RSID 值，降低 settings.xml 与正文引用不一致的风险。
 
-目标字段：
+### 4.2 设计原则
 
-1. `docProps/core.xml` 中的 `dc:creator`；
-2. `docProps/core.xml` 中的 `cp:lastModifiedBy`；
-3. `docProps/core.xml` 中的 `dcterms:created`；
-4. `docProps/core.xml` 中的 `dcterms:modified`；
-5. `docProps/app.xml` 中的 `ep:TotalTime`。
+RSID 是 Word 文档中的编辑会话标记痕迹，和编辑过程相关，但不能等同于真实编辑次数。
 
-输出规则：
+GUI 文案应使用以下表达：
 
-- 输出文件为原文件 stem + `_cleaned.docx`；
-- 输出文件保存到原文件相同目录；
-- 不覆盖原文件；
-- 修改完成后应能被本工具再次分析；
-- 生成文件应能被 Microsoft Word 正常打开。
+- “RSID 数量可反映文档内部编辑会话痕迹，但不能等同于真实编辑次数。”
+- “本功能用于规范化异常 RSID 值，并同步更新文档中的 RSID 引用。”
 
-### 4.2 本阶段允许修改
+避免使用以下表达：
 
-允许修改：
-
-- `DocxWhereisAI.py`
-
-不允许修改：
-
-- `PPTwhereisAI.py`
-- `static.md`
-- `runtime.md`，除非用户明确要求由 Codex 更新状态
-- `README.md`
-- 本地测试文件 `stage6.0.docx`
-- `.venv/`
-- `__pycache__/`
-- 生成文件 `*_cleaned.docx` 或 `*_modified.docx`
+- “RSID 数量 = 文档编辑次数”；
+- “伪装编辑历史”；
+- “绕过检测”；
+- “生成自然编辑痕迹”。
 
 ### 4.3 本阶段功能范围
 
 需要实现：
 
-1. 点击主窗口 `修改元数据` 后打开 `Toplevel` 修改窗口；
-2. 修改窗口提供以下控件：
-   - 创建者 Entry；
-   - 最后修改人 Entry；
-   - 编辑时长 Spinbox，范围 0 到 9999；
-   - 创建时间 Spinbox 组合：年、月、日、时、分、秒；
-   - 修改时间 Spinbox 组合：年、月、日、时、分、秒；
-   - 是否统一 ZIP 内部时间戳 Checkbutton，默认勾选；
-   - 应用修改按钮；
-   - 取消按钮。
-3. 时间字段默认值使用当前 UTC 时间；
-4. 保存时间格式为 `YYYY-MM-DDTHH:MM:SSZ`；
-5. 点击应用后生成 `_cleaned.docx`；
-6. 修改完成后弹窗显示输出路径；
-7. 修改完成后不要自动覆盖 GUI 当前选中文件，除非用户后续明确要求。
+1. 新增 RSID 处理入口，建议放在主窗口中，按钮文案可为：`处理 RSID`。
+2. 未选择文件时点击 `处理 RSID`，弹出友好提示。
+3. 已选择 `.docx` 后，打开 RSID 处理窗口。
+4. RSID 处理窗口显示：
+   - settings.xml 中声明的 RSID 数量；
+   - document.xml 中正文使用到的独立 RSID 数量；
+   - 异常 RSID 值列表。
+5. 异常 RSID 初始定义：
+   - `00000000`；
+   - `FFFFFFFF`；
+   - 非 8 位十六进制；
+   - 空值；
+   - settings.xml 与 document.xml 中存在明显不一致时，应在窗口中提示，不要求本轮完全修复所有不一致。
+6. 提供按钮：`重新生成异常 RSID 值`。
+7. 重新生成规则：
+   - 保持 RSID 数量不变；
+   - 生成 8 位大写十六进制字符串；
+   - 不生成 `00000000` 或 `FFFFFFFF`；
+   - 尽量避免与当前文档中已有 RSID 冲突；
+   - 使用稳定映射：同一个旧 RSID 在所有位置映射到同一个新 RSID。
+8. 同步更新：
+   - `word/settings.xml` 中 `<w:rsid w:val="..."/>`；
+   - `word/document.xml` 中 `w:rsidR`、`w:rsidRPr`、`w:rsidRDefault`、`w:rsidP`。
+9. 输出 `_cleaned.docx`，不覆盖原文件。
+10. 生成后可以重新分析，确认异常 RSID 值已被替换。
 
-### 4.4 实现约束
+### 4.4 明确不做
 
-实现时应注意：
+本阶段不做：
 
-1. 保留现有分析功能；
-2. 不破坏 `analyze_docx()`；
-3. 不重新引入命令行 `input()`；
-4. 不重新引入硬编码 `FILE_PATH` 主流程；
-5. ZIP 重写时尽量保留未修改条目的原始 `ZipInfo` 元信息；
-6. 只修改 `docProps/core.xml` 和 `docProps/app.xml`；
-7. 如果某个 XML 文件缺失，应弹出友好错误或在 messagebox 中提示，不崩溃；
-8. 本阶段不处理 RSID；
-9. 本阶段不实现一键清理；
-10. 文件选择器中“所有文件”选项可顺手移除，只保留 `.docx`。
+- 不允许用户指定 RSID 数量；
+- 不删除 RSID；
+- 不增加 RSID 数量；
+- 不逐属性完全随机；
+- 不处理 header/footer/comments/footnotes/endnotes 中的 RSID，除非当前代码已易于扩展且不会增加风险；
+- 不处理样式异常；
+- 不处理一键清理；
+- 不处理 PPT；
+- 不写 README。
 
-### 4.5 验收标准
+### 4.5 技术实现要求
+
+建议新增或拆分以下函数：
+
+- `collect_rsid_info(source_path: Path) -> dict`
+- `generate_rsid_mapping(old_values: Iterable[str]) -> dict[str, str]`
+- `write_rsid_cleaned_docx(source_path: Path, mapping: dict[str, str]) -> Path`
+
+ZIP 重写要求：
+
+- 只修改 `word/settings.xml` 与 `word/document.xml`；
+- 其他 ZIP 条目内容不变；
+- 尽量保留未修改条目的 `ZipInfo` 元信息；
+- 输出文件仍为 `_cleaned.docx`；
+- 如果 `_cleaned.docx` 已存在，可以覆盖 cleaned 文件，但不能覆盖原始文件。
+
+### 4.6 验收标准
 
 本 active 任务完成标准：
 
 1. `python3 -m py_compile DocxWhereisAI.py` 通过；
 2. `python3 DocxWhereisAI.py` 能启动 GUI；
-3. 未选择文件时点击 `修改元数据` 有友好提示；
-4. 选择 `.docx` 后点击 `修改元数据` 能打开修改窗口；
-5. 修改窗口可填写创建者、最后修改人、编辑时长、创建时间和修改时间；
-6. 点击应用后生成 `_cleaned.docx`；
-7. 原文件不被覆盖；
-8. 生成文件能再次被本工具分析；
-9. 再次分析能看到创建者、最后修改人、编辑时长、创建时间、修改时间发生变化；
-10. `PPTwhereisAI.py` 未被修改；
-11. 未提交 `stage6.0.docx`、`.venv/`、`__pycache__/` 或生成文件。
+3. 未选择文件时点击 `处理 RSID` 有友好提示；
+4. 选择 `.docx` 后可以打开 RSID 处理窗口；
+5. 窗口能显示 settings.xml 与 document.xml 中的 RSID 概况；
+6. 异常 RSID 能被识别；
+7. 点击 `重新生成异常 RSID 值` 后生成 `_cleaned.docx`；
+8. 再次分析 `_cleaned.docx` 后，异常 RSID 值被替换；
+9. RSID 数量保持不变；
+10. 原文件不被覆盖；
+11. `PPTwhereisAI.py` 未被修改；
+12. 未提交 `stage6.0.docx`、`.venv/`、`__pycache__/` 或生成文件。
 
-### 4.6 缺失上下文与阻塞项
+### 4.7 缺失上下文与阻塞项
 
 当前无阻塞项。
 
-仍需用户本地手动验证：
+需要用户本地手动验证：
 
-- Word 是否能正常打开生成的 `_cleaned.docx`；
-- GUI 修改窗口布局是否可接受；
-- 修改后的字段是否符合用户预期。
+- 真实测试文件中是否存在异常 RSID；
+- 如果测试文件没有异常 RSID，是否需要临时生成测试 DOCX 或通过测试副本制造 `00000000` / `FFFFFFFF` 用于验证；
+- Word 是否能正常打开生成的 `_cleaned.docx`。
 
 ---
 
 ## 5. 后续步骤
 
-### Next 任务 B4：RSID 与 ZIP 时间戳整理
+### Next 任务 B5：ZIP 内部时间戳分布整理
 
 状态：planned
 
 目标：
 
-- 实现 RSID 列表编辑；
-- 实现正文 RSID 属性替换；
-- 实现 ZIP 内部时间戳统一；
-- 将 ZIP 时间戳整理逻辑纳入更统一的清理流程。
+- 实现“处理时间戳”入口；
+- 提供 ZIP 内部时间戳整理模式；
+- 优先实现模式 C：按原始唯一时间戳分组映射到新时间戳；
+- 保持 ZIP 内部时间戳结构一致、可解释、可验证。
 
-### Next 任务 B5：一键整理
+计划方案：
+
+1. 新增按钮：`处理时间戳`。
+2. 新增时间戳处理窗口。
+3. 提供至少三种模式：
+   - 模式 A：保留原始 ZIP 时间戳；
+   - 模式 B：统一为用户指定修改时间；
+   - 模式 C：分布整理。
+4. 模式 C 规则：
+   - 不逐文件完全随机；
+   - 按原始唯一时间戳分组；
+   - 每个原始唯一时间戳映射到一个新时间戳；
+   - 同一组文件仍共享同一个新时间戳；
+   - 偏移范围由用户设置，例如 `0–180 秒` 或 `0–10 分钟`；
+   - 默认基准时间使用用户选择的修改时间；
+   - 不改变 ZIP entry 数量；
+   - 尽量保留原始 ZIP 条目的 `compress_type`、`external_attr`、`extra`、`comment` 等信息。
+5. GUI 文案避免使用“自然”“不可检测”“伪装”等表达。
+6. 输出 `_cleaned.docx`，不覆盖原文件。
+7. 修改完成后可再次分析验证 ZIP 时间戳分布变化。
+
+### Next 任务 B6：样式 ID 与引用关系整理
+
+状态：planned，需要用户确认细节后才能进入 active
+
+目标：
+
+- 处理样式异常，但不默认删除样式；
+- 第一版只考虑可疑 `styleId` 重命名与引用同步；
+- 将样式功能作为高风险功能单独推进。
+
+进入 active 前必须和用户确认：
+
+1. 如何定义“异常样式 ID”；
+2. 是否只重命名可疑 `styleId`；
+3. 是否同步更新 `styles.xml` 内部引用：`w:basedOn`、`w:next`、`w:link`、`w:styleLink`、`w:numStyleLink`；
+4. 是否同步更新正文、页眉、页脚、批注、脚注、尾注等 part 中的样式引用；
+5. 是否允许删除未使用样式。默认不删除。
+
+### Next 任务 B7：一键整理
 
 状态：planned
 
 目标：
 
-- 基于 B3 和 B4 的底层修改函数实现一键整理；
-- 使用默认隐私整理值；
-- 生成 `_cleaned.docx`；
-- 避免重复代码。
+- 基于基础元数据修改、RSID 规范化、时间戳分布整理等底层函数组合实现一键整理；
+- 默认值和修改范围必须明确；
+- 不把不可逆修改隐藏在模糊按钮后。
 
-### Next 任务 B6：macOS 稳定性检查
+### Next 任务 B8：macOS 稳定性检查
 
 状态：planned
 
@@ -302,7 +371,7 @@
 - 检查错误弹窗；
 - 检查不同 DOCX 文件的兼容性。
 
-### Next 任务 B7：Windows 兼容性检查
+### Next 任务 B9：Windows 兼容性检查
 
 状态：planned
 
@@ -313,7 +382,7 @@
 - 检查打开文件夹逻辑；
 - 明确 Windows 上的最低运行方式。
 
-### Next 任务 B8：README 与发布说明
+### Next 任务 B10：README 与发布说明
 
 状态：planned
 
@@ -331,7 +400,9 @@
 
 - 不处理 `PPTwhereisAI.py`；
 - 不写 README；
-- 不做 RSID 修改；
+- 不做 RSID 数量编辑；
+- 不做 ZIP 时间戳分布整理；
+- 不做样式异常处理；
 - 不做一键清理；
 - 不添加安装包配置；
 - 不添加批量处理；
