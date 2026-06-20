@@ -1,6 +1,6 @@
 """
-DOCX 元数据输出器（带时间戳修改功能）
-=================================
+DOCX 元数据查看与清洗器
+======================
 检查内容：
 1. docProps/core.xml   -> 作者、最后修改人、创建/修改时间
 2. docProps/app.xml    -> 应用版本、修订次数、总编辑时长、字数等
@@ -14,24 +14,23 @@ DOCX 元数据输出器（带时间戳修改功能）
 10. 实际字数统计与 app.xml 记录对比
 11. word/media/ 中图片的 EXIF 信息
 
-新增交互：分析完成后询问是否修改时间戳
-- 若选是，将：
-  1) docProps/core.xml 中的创建/修改时间改为当前 UTC 时间
-  2) ZIP 包内所有文件的内部时间戳改为当前时间
-- 生成新文件，文件名在原文件名后添加 _modified 后缀
+当前阶段：
+- tkinter GUI 文件选择与分析报告展示
+- 修改/清理功能保留入口，后续阶段实现
 """
 
+import io
 import zipfile
-import shutil
 import re
+import tempfile
+import tkinter as tk
+from contextlib import redirect_stdout
 from pathlib import Path
 from datetime import datetime, timezone
 from collections import Counter
+from tkinter import filedialog, messagebox
+from tkinter.scrolledtext import ScrolledText
 import xml.etree.ElementTree as ET
-
-# ====== 在这里改成你的文件路径 ======
-FILE_PATH = "/Users/smter-mac/Downloads/stage6.0_modified.docx"
-# ====================================
 
 NS_CP = "http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
 NS_DC = "http://purl.org/dc/elements/1.1/"
@@ -441,6 +440,78 @@ def check_embedded_media_exif(z, tmp_dir):
         print("  未在图片中发现可读 EXIF 信息。")
 
 
+# ===== 阶段2完成：报告展示 =====
+def _run_check(check_name, check_func, z, *args):
+    try:
+        check_func(z, *args)
+    except Exception as exc:
+        print(f"\n  ⚠ {check_name} 检查失败: {exc}")
+
+
+def analyze_docx(path: Path) -> str:
+    path = Path(path)
+    output = io.StringIO()
+
+    with redirect_stdout(output):
+        print(f"正在分析文件: {path}")
+
+        if not path.exists():
+            print(f"错误：文件不存在: {path}")
+            return output.getvalue()
+
+        try:
+            print(f"文件大小: {path.stat().st_size / 1024:.1f} KB")
+        except OSError as exc:
+            print(f"错误：无法读取文件信息: {exc}")
+            return output.getvalue()
+
+        try:
+            with zipfile.ZipFile(path, "r") as z:
+                names = set(z.namelist())
+                required_parts = ["[Content_Types].xml", "word/document.xml"]
+                missing_parts = [part for part in required_parts if part not in names]
+                if missing_parts:
+                    print(
+                        "错误：文件不是合法 DOCX，缺少必要结构: "
+                        + ", ".join(missing_parts)
+                    )
+                    return output.getvalue()
+
+                checks = [
+                    ("核心属性", check_core_properties, ()),
+                    ("应用属性", check_app_properties, ()),
+                    ("修订会话ID", check_rsid, ()),
+                    ("修订记录残留", check_track_changes, ()),
+                    ("批注信息", check_comments, ()),
+                    ("自定义属性", check_custom_properties, ()),
+                    ("ZIP 内部文件时间戳", check_zip_timestamps, ()),
+                    ("样式表一致性", check_styles_consistency, ()),
+                    ("语言标记分布", check_lang_distribution, ()),
+                    ("字数统计交叉核对", check_word_count, ()),
+                ]
+                for check_name, check_func, args in checks:
+                    _run_check(check_name, check_func, z, *args)
+
+                with tempfile.TemporaryDirectory() as tmp_name:
+                    _run_check(
+                        "嵌入图片 EXIF 信息",
+                        check_embedded_media_exif,
+                        z,
+                        Path(tmp_name),
+                    )
+
+                section("检查完毕")
+                print("以上信息仅供自查参考，不构成任何结论性证据。\n")
+        except zipfile.BadZipFile:
+            print("错误：文件不是合法 ZIP/DOCX，无法打开。")
+        except OSError as exc:
+            print(f"错误：无法读取文件: {exc}")
+        except Exception as exc:
+            print(f"错误：分析过程中发生异常: {exc}")
+
+    return output.getvalue()
+
+
 def modify_timestamps(original_path):
     """
     修改时间戳：
@@ -491,48 +562,117 @@ def modify_timestamps(original_path):
     return new_path
 
 
+# ===== 阶段1完成：GUI 基础框架 =====
+class DocxMetadataApp:
+    def __init__(self, root):
+        self.root = root
+        self.selected_path = None
+
+        self.root.title("DOCX 元数据查看与清洗器")
+        self.root.geometry("980x720")
+
+        self._build_widgets()
+
+    def _build_widgets(self):
+        toolbar = tk.Frame(self.root, padx=10, pady=10)
+        toolbar.pack(fill=tk.X)
+
+        select_button = tk.Button(
+            toolbar,
+            text="选择 DOCX 文件",
+            command=self.select_file,
+            width=16,
+        )
+        select_button.pack(side=tk.LEFT, padx=(0, 8))
+
+        analyze_button = tk.Button(
+            toolbar,
+            text="分析",
+            command=self.analyze_selected_file,
+            width=10,
+        )
+        analyze_button.pack(side=tk.LEFT, padx=(0, 8))
+
+        metadata_button = tk.Button(
+            toolbar,
+            text="修改元数据",
+            command=self.show_future_message,
+            width=12,
+        )
+        metadata_button.pack(side=tk.LEFT, padx=(0, 8))
+
+        clean_button = tk.Button(
+            toolbar,
+            text="一键清理",
+            command=self.show_future_message,
+            width=12,
+        )
+        clean_button.pack(side=tk.LEFT)
+
+        self.report_text = ScrolledText(
+            self.root,
+            wrap=tk.WORD,
+            font=("Menlo", 12),
+            padx=10,
+            pady=10,
+        )
+        self.report_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self.report_text.configure(state=tk.DISABLED)
+
+        self.status_label = tk.Label(
+            self.root,
+            text="请选择 DOCX 文件进行分析",
+            anchor=tk.W,
+            padx=10,
+            pady=6,
+            relief=tk.SUNKEN,
+        )
+        self.status_label.pack(fill=tk.X, side=tk.BOTTOM)
+
+    def select_file(self):
+        filename = filedialog.askopenfilename(
+            title="选择 DOCX 文件",
+            filetypes=[
+                ("Word 文档", "*.docx"),
+                ("所有文件", "*.*"),
+            ],
+        )
+        if not filename:
+            return
+
+        self.selected_path = Path(filename)
+        self.status_label.configure(text=f"当前文件: {self.selected_path}")
+
+    def analyze_selected_file(self):
+        if self.selected_path is None:
+            messagebox.showwarning("未选择文件", "请先选择 DOCX 文件。")
+            return
+
+        self.status_label.configure(text=f"正在分析: {self.selected_path}")
+        self.root.update_idletasks()
+
+        report = analyze_docx(self.selected_path)
+        self.set_report(report)
+
+        if self.selected_path.exists():
+            self.status_label.configure(text=f"分析完成: {self.selected_path}")
+        else:
+            self.status_label.configure(text=f"文件不存在: {self.selected_path}")
+
+    def set_report(self, report):
+        self.report_text.configure(state=tk.NORMAL)
+        self.report_text.delete("1.0", tk.END)
+        self.report_text.insert(tk.END, report)
+        self.report_text.configure(state=tk.DISABLED)
+
+    def show_future_message(self):
+        messagebox.showinfo("后续阶段实现", "该功能将在后续阶段实现。")
+
+
 def main():
-    path = Path(FILE_PATH)
-    if not path.exists():
-        print(f"文件不存在: {path}")
-        return
-
-    tmp_dir = Path("/tmp/docx_forensics_tmp")
-    if tmp_dir.exists():
-        shutil.rmtree(tmp_dir)
-    tmp_dir.mkdir()
-
-    print(f"正在分析文件: {path}")
-    print(f"文件大小: {path.stat().st_size / 1024:.1f} KB")
-
-    with zipfile.ZipFile(path, "r") as z:
-        check_core_properties(z)
-        check_app_properties(z)
-        check_rsid(z)
-        check_track_changes(z)
-        check_comments(z)
-        check_custom_properties(z)
-        check_zip_timestamps(z)
-        check_styles_consistency(z)
-        check_lang_distribution(z)
-        check_word_count(z)
-        check_embedded_media_exif(z, tmp_dir)
-
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    section("检查完毕")
-    print("以上信息仅供自查参考，不构成任何结论性证据。\n")
-
-    # ===== 新增交互部分 =====
-    answer = input("是否修改时间戳？(y/n): ").strip().lower()
-    if answer == "y":
-        print("\n开始修改时间戳...")
-        try:
-            modify_timestamps(FILE_PATH)
-        except Exception as e:
-            print(f"修改过程出错: {e}")
-    else:
-        print("已取消修改。")
+    root = tk.Tk()
+    DocxMetadataApp(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":
