@@ -1,0 +1,14 @@
+# local test files
+stage6.0.docx
+
+# generated DOCX outputs
+*_cleaned.docx
+*_modified.docx
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store
